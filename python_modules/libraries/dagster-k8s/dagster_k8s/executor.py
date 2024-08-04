@@ -1,7 +1,8 @@
-from typing import Iterator, List, Optional, cast
+from typing import Iterator, List, Literal, Optional, cast
 
 import kubernetes.config
 from dagster import (
+    Config,
     Field,
     IntSource,
     Noneable,
@@ -12,6 +13,8 @@ from dagster import (
 from dagster._core.definitions.executor_definition import multiple_process_executor_requirements
 from dagster._core.definitions.metadata import MetadataValue
 from dagster._core.events import DagsterEvent, EngineEventData
+from dagster._core.execution.context.system import StepExecutionContext
+from dagster._core.execution.plan.inputs import FromInputManager, FromStepOutput, StepInput
 from dagster._core.execution.retries import RetryMode, get_retries_config
 from dagster._core.execution.tags import get_tag_concurrency_limits_config
 from dagster._core.executor.base import Executor
@@ -29,6 +32,7 @@ from dagster_k8s.launcher import K8sRunLauncher
 from .client import DagsterKubernetesClient
 from .container_context import K8sContainerContext
 from .job import (
+    USER_DEFINED_K8S_CONFIG_KEY,
     USER_DEFINED_K8S_CONFIG_SCHEMA,
     DagsterK8sJobConfig,
     UserDefinedDagsterK8sConfig,
@@ -341,3 +345,118 @@ class K8sStepHandler(StepHandler):
         )
 
         self._api_client.delete_job(job_name=job_name, namespace=container_context.namespace)
+
+
+K8S_OP_STRATEGY = Literal["all", "first", "select"]
+
+
+class OpInputStrategy(Config):
+    strategy: K8S_OP_STRATEGY = Field(
+        str,
+        "first",
+        is_required=False,
+        description="the strategy with which we resolve multiple ops with k8s metadata",
+    )
+    input_keys: list[str] = Field(
+        list[str],
+        default_value=None,
+        is_required=False,
+        description="given op strategy is 'select', the op inputs which are used combined to form the current ops config",
+    )
+
+
+K8S_OP_EXECUTOR_CONFIG_SCHEMA = merge_dicts(
+    _K8S_EXECUTOR_CONFIG_SCHEMA,
+    {
+        "input_strategy": Field(
+            Optional[OpInputStrategy],
+            default_value=None,
+            is_required=False,
+            description="how to consume output metadata for current op input",
+        )
+    },
+)
+
+
+class K8sOpStepHandler(K8sStepHandler):
+    """Specialized step handler that configure the next op based on the op metadata of the prior op."""
+
+    input_strategy: OpInputStrategy
+
+    def __init__(
+        self,
+        image: str | None,
+        container_context: K8sContainerContext,
+        load_incluster_config: bool,
+        kubeconfig_file: str | None,
+        k8s_client_batch_api=None,
+        input_strategy: Optional[OpInputStrategy] = None,
+    ):
+        self.input_strategy = input_strategy
+        super().__init__(
+            image, container_context, load_incluster_config, kubeconfig_file, k8s_client_batch_api
+        )
+
+    def _get_input_metadata(self, op_input: StepInput, step_context: StepExecutionContext) -> dict:
+        input_def = step_context.op_def.input_def_named(op_input.name)
+        source = op_input.source
+        if isinstance(source, FromInputManager):
+            if input_def.metadata:
+                return input_def.metadata.get(USER_DEFINED_K8S_CONFIG_KEY, {})
+            return {}
+        if isinstance(source, FromStepOutput):
+            if source.fan_in:
+                step_context.log.info("fan in step input metadata not supported")
+                return {}
+            upstream_output_handle = source.step_output_handle
+            output_name = upstream_output_handle.output_name
+            upstream_step = step_context.execution_plan.get_step_output(upstream_output_handle)
+            job_def = step_context.job_def
+            upstream_node = job_def.get_node(upstream_step.node_handle)
+            if not upstream_node.has_output(output_name):
+                step_context.log.error(
+                    f"corresponding upstream {output_name} output source for input {op_input.name} not found"
+                )
+                return {}
+            output_def = upstream_node.output_def_named(output_name)
+            if output_def.metadata:
+                return output_def.metadata.get(USER_DEFINED_K8S_CONFIG_KEY, {})
+            return {}
+
+    def _resolve_input_configs(
+        self, step_handler_context: StepHandlerContext
+    ) -> Optional[K8sContainerContext]:
+        """Fetch all the configured k8s metadata for op inputs."""
+        step_key = self._get_step_key(step_handler_context)
+        step_context = step_handler_context.get_step_context(step_key)
+        container_context = None
+        for input_name, step_input in step_context.step.step_input_dict.items():
+            if (
+                self.input_strategy.strategy == "select"
+                and input_name not in self.input_strategy.input_keys
+            ):
+                continue
+            op_metadata_config = self._get_input_metadata(step_input, step_context)
+            if not op_metadata_config:
+                continue
+            k8s_context = K8sContainerContext.create_from_config(op_metadata_config)
+            if self.input_strategy.strategy == "first":
+                step_context.log.info(f"using config metadata from {input_name}")
+                step_context.log.debug(f"configure metadata {op_metadata_config}")
+                return k8s_context
+            if container_context is None:
+                container_context = k8s_context
+            else:
+                container_context.merge(k8s_context)
+        return container_context
+
+    def _get_container_context(
+        self, step_handler_context: StepHandlerContext
+    ) -> K8sContainerContext:
+        context = super()._get_container_context(step_handler_context)
+        if not self.op_input_config:
+            return context
+        step_key = self._get_step_key(step_handler_context)
+        step_context = step_handler_context.get_step_context(step_key)
+        self._resolve_input_configs(step_context)
+        return context
