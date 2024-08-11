@@ -195,7 +195,7 @@ def get_k8s_resource_requirements(tags: Mapping[str, str]):
     return result.value
 
 
-def get_user_defined_k8s_config(tags: Mapping[str, str]):
+def get_user_defined_k8s_config(tags: Mapping[str, str]) -> UserDefinedDagsterK8sConfig:
     check.mapping_param(tags, "tags", key_type=str, value_type=str)
 
     if not any(key in tags for key in [K8S_RESOURCE_REQUIREMENTS_KEY, USER_DEFINED_K8S_CONFIG_KEY]):
